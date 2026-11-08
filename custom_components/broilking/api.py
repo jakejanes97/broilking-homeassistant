@@ -9,8 +9,10 @@ UART checksum itself. Raw temperatures are always Fahrenheit.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 
 import aiohttp
 
@@ -19,6 +21,33 @@ _LOGGER = logging.getLogger(__name__)
 
 class BroilKingError(Exception):
     """Raised when the smoker cannot be reached or returns an error."""
+
+
+# Same pause the cook-timer number uses before trusting a read-back.
+# The control board needs about 1.5 s to echo a write.
+TARGET_ACK_DELAY = 2.0
+
+
+def ensure_target_confirmed(reported_f, requested_f, label: str) -> None:
+    """Raise unless a later read shows the Fahrenheit target that was sent."""
+    requested = int(requested_f)
+    if reported_f is None or int(reported_f) != requested:
+        raise BroilKingError(
+            f"{label} {requested} F was not confirmed; grill reports {reported_f} F"
+        )
+
+
+def _payload_suffix(payload) -> str:
+    """Short rejection detail with any pass field removed."""
+    safe = payload
+    if isinstance(payload, dict):
+        safe = {k: v for k, v in payload.items() if str(k).lower() != "pass"}
+    if safe in ("", None, {}, []):
+        return ""
+    text = str(safe)
+    if len(text) > 180:
+        text = text[:180] + "..."
+    return f": {text}"
 
 
 class BroilKingClient:
@@ -39,6 +68,8 @@ class BroilKingClient:
         self._session = session
         self._password = password or ""
         self._id = 0
+        self._last_code = None
+        self._last_warn = 0.0
 
     # ---- low level -----------------------------------------------------
     async def _rpc(self, method: str, args: dict | None = None):
@@ -57,6 +88,7 @@ class BroilKingClient:
                         if resp.get("id") != rid:
                             continue
                         err = resp.get("error")
+                        self._last_code = err.get("code") if isinstance(err, dict) else None
                         if err is None:
                             return True, resp.get("result")
                         raw = err.get("message", "")
@@ -82,15 +114,39 @@ class BroilKingClient:
             raise BroilKingError(f"Sys.GetInfo failed: {exc}") from exc
 
     async def async_get_temperatures(self) -> dict:
-        args = {"reply": "full"}
-        if self._password:
-            args["pass"] = self._password
-        ok, payload = await self._rpc("GetCurrentTemperatures", args)
-        if ok and isinstance(payload, dict):
-            return payload.get("GetCurrentTemperatures", {})
-        return {}
+        # Newer firmware dropped GetCurrentTemperatures; GetAllValues (read-only,
+        # no args) returns the state under different key names. Map them back to
+        # the keys the entities already use.
+        self._last_code = None
+        ok, p = await self._rpc("GetAllValues")
+        if ok and isinstance(p, dict) and "grillTemp" in p:
+            def probe(v):
+                # 65535 (or 0) == probe unplugged -> 0, which the entities report as unknown
+                return 0 if v is None or v >= 65535 else v
+            return {
+                "grillTemp": p.get("grillTemp"),
+                "grillSetTemp": p.get("grillSetTemp"),
+                "moduleIsOn": p.get("grillOn"),
+                "probe_1_Temp": probe(p.get("probe01Temp")),
+                "probe_2_Temp": probe(p.get("probe02Temp")),
+                "probe_1_Set_Temp": p.get("probe01SetTemp"),
+                "probe_2_Set_Temp": p.get("probe02SetTemp"),
+                "alarm_Hour": 0,
+                "alarm_Minute": p.get("timer") or 0,
+            }
+        now = time.monotonic()
+        if now - self._last_warn >= 300:
+            self._last_warn = now
+            _LOGGER.warning("GetAllValues unusable (code=%s)", self._last_code)
+        raise BroilKingError("unusable GetAllValues reply")
 
     # ---- control -------------------------------------------------------
+    # Setpoints stay on the published SendGenericCommand frames (actions 1/2/3,
+    # degrees F). No public source substantiates a different write method for
+    # firmware that answers GetAllValues, so this client does not send one.
+    # A frame the firmware rejects, or a read-back that still shows the previous
+    # setpoint, is a failure. Acceptance by a given grill is established only
+    # when that grill echoes the new value.
     @staticmethod
     def _generic_command_string(action: int, value: int = 0, value2: int = 0) -> str:
         lo = value % 256
@@ -117,15 +173,44 @@ class BroilKingClient:
         }
         return await self._rpc("SendGenericCommand", args)
 
+    async def _require_target(self, ok: bool, payload, label: str, temp_f: int):
+        if not ok:
+            raise BroilKingError(
+                f"{label} {int(temp_f)} F rejected by SendGenericCommand"
+                + _payload_suffix(payload)
+            )
+        return ok, payload
+
+    async def _confirm_setpoint(self, label: str, temp_f: int, field: str):
+        await asyncio.sleep(TARGET_ACK_DELAY)
+        try:
+            data = await self.async_get_temperatures()
+        except BroilKingError as exc:
+            raise BroilKingError(
+                f"{label} {int(temp_f)} F was not confirmed: {exc}"
+            ) from exc
+        ensure_target_confirmed(data.get(field), temp_f, label)
+        return data
+
     async def async_set_grill_target_f(self, temp_f: int):
-        return await self._send_generic(self.ACT_GRILL_TEMP, int(temp_f))
+        temp_f = int(temp_f)
+        ok, payload = await self._send_generic(self.ACT_GRILL_TEMP, temp_f)
+        await self._require_target(ok, payload, "grill target", temp_f)
+        await self._confirm_setpoint("grill target", temp_f, "grillSetTemp")
+        return ok, payload
 
     async def async_set_mode(self, mode_id: int):
         return await self._send_generic(self.ACT_COOKING_MODE, int(mode_id) & 0xFF)
 
     async def async_set_probe_target_f(self, probe: int, temp_f: int):
+        temp_f = int(temp_f)
         act = self.ACT_PROBE1 if probe == 1 else self.ACT_PROBE2
-        return await self._send_generic(act, int(temp_f))
+        label = f"probe {probe} target"
+        ok, payload = await self._send_generic(act, temp_f)
+        await self._require_target(ok, payload, label, temp_f)
+        field = "probe_1_Set_Temp" if probe == 1 else "probe_2_Set_Temp"
+        await self._confirm_setpoint(label, temp_f, field)
+        return ok, payload
 
     async def async_set_timer(self, hours: int, minutes: int):
         return await self._send_generic(self.ACT_TIMER, int(hours), int(minutes))

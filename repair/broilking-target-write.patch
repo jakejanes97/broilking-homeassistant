@@ -1,0 +1,182 @@
+--- a/api.py
++++ b/api.py
+@@ -9,6 +9,7 @@
+ """
+ from __future__ import annotations
+ 
++import asyncio
+ import json
+ import logging
+ import time
+@@ -20,6 +21,33 @@
+ 
+ class BroilKingError(Exception):
+     """Raised when the smoker cannot be reached or returns an error."""
++
++
++# Same pause the cook-timer number uses before trusting a read-back.
++# The control board needs about 1.5 s to echo a write.
++TARGET_ACK_DELAY = 2.0
++
++
++def ensure_target_confirmed(reported_f, requested_f, label: str) -> None:
++    """Raise unless a later read shows the Fahrenheit target that was sent."""
++    requested = int(requested_f)
++    if reported_f is None or int(reported_f) != requested:
++        raise BroilKingError(
++            f"{label} {requested} F was not confirmed; grill reports {reported_f} F"
++        )
++
++
++def _payload_suffix(payload) -> str:
++    """Short rejection detail with any pass field removed."""
++    safe = payload
++    if isinstance(payload, dict):
++        safe = {k: v for k, v in payload.items() if str(k).lower() != "pass"}
++    if safe in ("", None, {}, []):
++        return ""
++    text = str(safe)
++    if len(text) > 180:
++        text = text[:180] + "..."
++    return f": {text}"
+ 
+ 
+ class BroilKingClient:
+@@ -113,6 +141,12 @@
+         raise BroilKingError("unusable GetAllValues reply")
+ 
+     # ---- control -------------------------------------------------------
++    # Setpoints stay on the published SendGenericCommand frames (actions 1/2/3,
++    # degrees F). No public source substantiates a different write method for
++    # firmware that answers GetAllValues, so this client does not send one.
++    # A frame the firmware rejects, or a read-back that still shows the previous
++    # setpoint, is a failure. Acceptance by a given grill is established only
++    # when that grill echoes the new value.
+     @staticmethod
+     def _generic_command_string(action: int, value: int = 0, value2: int = 0) -> str:
+         lo = value % 256
+@@ -139,15 +173,44 @@
+         }
+         return await self._rpc("SendGenericCommand", args)
+ 
++    async def _require_target(self, ok: bool, payload, label: str, temp_f: int):
++        if not ok:
++            raise BroilKingError(
++                f"{label} {int(temp_f)} F rejected by SendGenericCommand"
++                + _payload_suffix(payload)
++            )
++        return ok, payload
++
++    async def _confirm_setpoint(self, label: str, temp_f: int, field: str):
++        await asyncio.sleep(TARGET_ACK_DELAY)
++        try:
++            data = await self.async_get_temperatures()
++        except BroilKingError as exc:
++            raise BroilKingError(
++                f"{label} {int(temp_f)} F was not confirmed: {exc}"
++            ) from exc
++        ensure_target_confirmed(data.get(field), temp_f, label)
++        return data
++
+     async def async_set_grill_target_f(self, temp_f: int):
+-        return await self._send_generic(self.ACT_GRILL_TEMP, int(temp_f))
++        temp_f = int(temp_f)
++        ok, payload = await self._send_generic(self.ACT_GRILL_TEMP, temp_f)
++        await self._require_target(ok, payload, "grill target", temp_f)
++        await self._confirm_setpoint("grill target", temp_f, "grillSetTemp")
++        return ok, payload
+ 
+     async def async_set_mode(self, mode_id: int):
+         return await self._send_generic(self.ACT_COOKING_MODE, int(mode_id) & 0xFF)
+ 
+     async def async_set_probe_target_f(self, probe: int, temp_f: int):
++        temp_f = int(temp_f)
+         act = self.ACT_PROBE1 if probe == 1 else self.ACT_PROBE2
+-        return await self._send_generic(act, int(temp_f))
++        label = f"probe {probe} target"
++        ok, payload = await self._send_generic(act, temp_f)
++        await self._require_target(ok, payload, label, temp_f)
++        field = "probe_1_Set_Temp" if probe == 1 else "probe_2_Set_Temp"
++        await self._confirm_setpoint(label, temp_f, field)
++        return ok, payload
+ 
+     async def async_set_timer(self, hours: int, minutes: int):
+         return await self._send_generic(self.ACT_TIMER, int(hours), int(minutes))
+--- a/climate.py
++++ b/climate.py
+@@ -68,8 +68,10 @@
+         temp_c = kwargs.get(ATTR_TEMPERATURE)
+         if temp_c is None:
+             return
++        # Raises unless SendGenericCommand is accepted and the next read echoes
++        # this Fahrenheit setpoint. Preset, power, and timer paths are unchanged.
+         await self.coordinator.client.async_set_grill_target_f(c_to_f(temp_c))
+-        await self.coordinator.async_request_refresh()
++        await self.coordinator.async_refresh()
+ 
+     async def async_set_preset_mode(self, preset_mode: str) -> None:
+         mode_id = MODE_IDS.get(preset_mode)
+--- a/coordinator.py
++++ b/coordinator.py
+@@ -15,7 +15,7 @@
+ 
+ 
+ class BroilKingCoordinator(DataUpdateCoordinator[dict]):
+-    """Polls GetCurrentTemperatures and shares the raw state dict."""
++    """Polls grill state and shares the raw dict."""
+ 
+     def __init__(self, hass: HomeAssistant, client: BroilKingClient, device_id: str):
+         super().__init__(
+--- a/manifest.json
++++ b/manifest.json
+@@ -7,5 +7,5 @@
+   "iot_class": "local_polling",
+   "issue_tracker": "https://github.com/bbirke/broilking-homeassistant/issues",
+   "requirements": [],
+-  "version": "0.1.1"
++  "version": "0.1.2"
+ }
+--- a/number.py
++++ b/number.py
+@@ -92,9 +92,9 @@
+ class BroilKingProbeTarget(BroilKingEntity, NumberEntity):
+     """Target temperature of a meat probe, in degrees C.
+ 
+-    Two-way like the cook timer: writing sends the setpoint to the control board
+-    (action 2 / 3, Fahrenheit) and the grill reports it back in
+-    probe_<n>_Set_Temp, so a target set on the grill's panel shows up here too.
++    Writing sends action 2 / 3 in Fahrenheit. The typed value is not published
++    locally: the client raises unless the grill's next read echoes it in
++    probe_<n>_Set_Temp. A target set on the grill's panel still shows up here.
+     """
+ 
+     _attr_device_class = NumberDeviceClass.TEMPERATURE
+@@ -109,24 +109,16 @@
+         super().__init__(coordinator, f"probe_{probe}_target_set")
+         self._probe = probe
+         self._attr_name = f"Probe {probe} Target Temperature"
+-        self._pending: float | None = None
+ 
+     @property
+     def native_value(self) -> float | None:
+-        if self._pending is not None:
+-            return self._pending
+         return f_to_c(self._data.get(f"probe_{self._probe}_Set_Temp"))
+ 
+     async def async_set_native_value(self, value: float) -> None:
++        # The client confirms the Fahrenheit echo before returning. Publishing
++        # `value` here made a write that the grill did not keep look accepted
++        # for BOARD_ACK_DELAY, which is the brief flash back to the old target.
+         await self.coordinator.client.async_set_probe_target_f(
+             self._probe, c_to_f(value)
+         )
+-
+-        self._pending = float(value)
+-        self.async_write_ha_state()
+-        try:
+-            await asyncio.sleep(BOARD_ACK_DELAY)
+-            await self.coordinator.async_refresh()
+-        finally:
+-            self._pending = None
+-            self.async_write_ha_state()
++        await self.coordinator.async_refresh()

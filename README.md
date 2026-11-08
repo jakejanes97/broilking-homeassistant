@@ -16,6 +16,14 @@ ranges, command codes, or reported fields may differ on other models.
 Use at your own risk: this integration can change your grill's setpoint and mode.
 Not affiliated with or endorsed by Broil King / Onward Manufacturing.
 
+## This fork
+
+Reads use `GetAllValues` with no arguments. Grill and probe target writes still
+use the `SendGenericCommand` frames in the protocol table, in Fahrenheit. Those
+calls fail if the firmware rejects the frame or the next read does not echo the
+new setpoint. `SendCustomCommand` is not used. Timer, mode, and power behavior
+is unchanged, and temperatures stay Celsius in Home Assistant.
+
 ## Install (HACS)
 
 1. HACS -> Integrations -> three-dot menu -> **Custom repositories** -> add this
