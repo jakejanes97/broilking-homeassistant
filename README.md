@@ -21,8 +21,11 @@ Not affiliated with or endorsed by Broil King / Onward Manufacturing.
 Reads use `GetAllValues` with no arguments. Grill and probe target writes still
 use the `SendGenericCommand` frames in the protocol table, in Fahrenheit. Those
 calls fail if the firmware rejects the frame or the next read does not echo the
-new setpoint. `SendCustomCommand` is not used. Timer, mode, and power behavior
-is unchanged, and temperatures stay Celsius in Home Assistant.
+new setpoint, and the failure is a Home Assistant service error. Firmware that
+answers `No handler for SendGenericCommand` has not registered that method, so
+the frame bytes are not a setpoint write on that firmware. No other target-write
+method is documented for it. `SendCustomCommand` is not used. Timer, mode, and
+power behavior is unchanged, and temperatures stay Celsius in Home Assistant.
 
 ## Install (HACS)
 

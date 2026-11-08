@@ -16,11 +16,18 @@ import time
 
 import aiohttp
 
+from homeassistant.exceptions import HomeAssistantError
+
 _LOGGER = logging.getLogger(__name__)
 
 
-class BroilKingError(Exception):
-    """Raised when the smoker cannot be reached or returns an error."""
+class BroilKingError(HomeAssistantError):
+    """Raised when the smoker cannot be reached or returns an error.
+
+    Service calls see this as a Home Assistant device error. A missing RPC
+    method is that kind of failure: the requested Fahrenheit value was in
+    range, and the firmware rejected the method.
+    """
 
 
 # Same pause the cook-timer number uses before trusting a read-back.

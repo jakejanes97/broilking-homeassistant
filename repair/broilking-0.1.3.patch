@@ -1,0 +1,36 @@
+diff --git a/api.py b/api.py
+index b405045..d05ec03 100644
+--- a/api.py
++++ b/api.py
+@@ -16,11 +16,18 @@ import time
+ 
+ import aiohttp
+ 
++from homeassistant.exceptions import HomeAssistantError
++
+ _LOGGER = logging.getLogger(__name__)
+ 
+ 
+-class BroilKingError(Exception):
+-    """Raised when the smoker cannot be reached or returns an error."""
++class BroilKingError(HomeAssistantError):
++    """Raised when the smoker cannot be reached or returns an error.
++
++    Service calls see this as a Home Assistant device error. A missing RPC
++    method is that kind of failure: the requested Fahrenheit value was in
++    range, and the firmware rejected the method.
++    """
+ 
+ 
+ # Same pause the cook-timer number uses before trusting a read-back.
+diff --git a/manifest.json b/manifest.json
+index 36f3793..a854eaa 100644
+--- a/manifest.json
++++ b/manifest.json
+@@ -7,5 +7,5 @@
+   "iot_class": "local_polling",
+   "issue_tracker": "https://github.com/bbirke/broilking-homeassistant/issues",
+   "requirements": [],
+-  "version": "0.1.2"
++  "version": "0.1.3"
+ }

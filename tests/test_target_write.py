@@ -39,8 +39,29 @@ GOLDEN_COMMANDS = {
 }
 
 
+class HomeAssistantError(Exception):
+    """Stand-in for homeassistant.exceptions.HomeAssistantError."""
+
+
+class ServiceValidationError(HomeAssistantError):
+    """Stand-in for homeassistant.exceptions.ServiceValidationError."""
+
+
+def ensure_ha_exceptions() -> None:
+    """Register exception stand-ins before api.py is imported."""
+    if "homeassistant.exceptions" in sys.modules:
+        return
+    if "homeassistant" not in sys.modules:
+        sys.modules["homeassistant"] = types.ModuleType("homeassistant")
+    module = types.ModuleType("homeassistant.exceptions")
+    module.HomeAssistantError = HomeAssistantError
+    module.ServiceValidationError = ServiceValidationError
+    sys.modules["homeassistant.exceptions"] = module
+
+
 def load(name: str):
     """Load an integration module without executing the HA package init."""
+    ensure_ha_exceptions()
     for mod_name, path in (
         ("custom_components", ROOT / "custom_components"),
         (PKG, ROOT / "custom_components" / "broilking"),
@@ -257,7 +278,7 @@ class TargetWriteTests(unittest.IsolatedAsyncioTestCase):
         manifest = json.loads(
             (ROOT / "custom_components" / "broilking" / "manifest.json").read_text()
         )
-        self.assertEqual(manifest["version"], "0.1.2")
+        self.assertEqual(manifest["version"], "0.1.3")
 
     def test_conversion_and_display_round_trip(self):
         stub_homeassistant()
@@ -313,6 +334,46 @@ class TargetWriteTests(unittest.IsolatedAsyncioTestCase):
         client = self.client([rpc_err(404, "missing")])
         with self.assertRaises(self.api.BroilKingError):
             await client.async_get_temperatures()
+
+    def test_device_error_is_home_assistant_error(self):
+        self.assertTrue(issubclass(self.api.BroilKingError, HomeAssistantError))
+        self.assertFalse(issubclass(self.api.BroilKingError, ServiceValidationError))
+
+    async def test_missing_send_generic_handler_is_one_call(self):
+        """Mongoose OS reports an unregistered method as code 404.
+
+        The message is a plain string, the call does not wait or retry, and
+        the exception Home Assistant handles is HomeAssistantError. A valid
+        175 F request is not a ServiceValidationError.
+        """
+        client = self.client(
+            [
+                {
+                    "error": {
+                        "code": 404,
+                        "message": "No handler for SendGenericCommand",
+                    }
+                }
+            ]
+        )
+        with self.assertRaises(self.api.BroilKingError) as ctx:
+            await client.async_set_probe_target_f(1, 175)
+        err = ctx.exception
+        self.assertIsInstance(err, HomeAssistantError)
+        self.assertNotIsInstance(err, ServiceValidationError)
+        text = str(err)
+        self.assertEqual(
+            text,
+            "probe 1 target 175 F rejected by SendGenericCommand"
+            ": No handler for SendGenericCommand",
+        )
+        self.assertEqual(self.sleeps, [])
+        self.assertEqual(len(client._session.sent), 1)
+        self.assertEqual(client._session.sent[0]["method"], "SendGenericCommand")
+        self.assertEqual(
+            client._session.sent[0]["args"]["command"],
+            GOLDEN_COMMANDS[(2, 175, 0)],
+        )
 
     async def test_probe_rejected_frame_raises_without_waiting(self):
         client = self.client(
