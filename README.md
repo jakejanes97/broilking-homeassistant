@@ -27,6 +27,10 @@ the frame bytes are not a setpoint write on that firmware. No other target-write
 method is documented for it. `SendCustomCommand` is not used. Timer, mode, and
 power behavior is unchanged, and temperatures stay Celsius in Home Assistant.
 
+`broilking.discover_commands` calls `RPC.List` once on the configured grill.
+The service accepts no RPC method name. It calls `RPC.Describe` only when that
+list contains `SendGenericCommand`. It does not call `FS.Get` or `Config.Get`.
+
 ## Install (HACS)
 
 1. HACS -> Integrations -> three-dot menu -> **Custom repositories** -> add this

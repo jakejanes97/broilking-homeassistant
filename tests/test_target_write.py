@@ -188,8 +188,10 @@ class FakeSession:
     def __init__(self, replies):
         self._replies = list(replies)
         self.sent = []
+        self.timeouts = []
 
     def ws_connect(self, url, timeout=10):
+        self.timeouts.append(timeout)
         if not self._replies:
             raise AssertionError(f"no fake reply left for {url}")
         return FakeWS(self, self._replies.pop(0))
@@ -278,7 +280,7 @@ class TargetWriteTests(unittest.IsolatedAsyncioTestCase):
         manifest = json.loads(
             (ROOT / "custom_components" / "broilking" / "manifest.json").read_text()
         )
-        self.assertEqual(manifest["version"], "0.1.3")
+        self.assertEqual(manifest["version"], "0.1.4")
 
     def test_conversion_and_display_round_trip(self):
         stub_homeassistant()

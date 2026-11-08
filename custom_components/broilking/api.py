@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 
 import aiohttp
@@ -34,6 +35,21 @@ class BroilKingError(HomeAssistantError):
 # The control board needs about 1.5 s to echo a write.
 TARGET_ACK_DELAY = 2.0
 
+# One attempt, no retry. Mongoose OS documents RPC.List with no arguments.
+DISCOVER_TIMEOUT = 8
+_MAX_METHOD_NAMES = 64
+# Documented target-control method in this integration. RPC.Describe is used
+# only when RPC.List actually returned this name. Other listed names are
+# reported and not called, so discovery does not pick an ambiguous setter.
+_DOCUMENTED_CONTROL_METHOD = "SendGenericCommand"
+_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9.]{0,63}$")
+_SECRET_RE = re.compile(
+    r"(?i)(?:^fs\.|^config\.|password|secret|credential|token|ssid|wifi|"
+    r"\bauth\b|certificate|private.?key|\bpass\b)"
+)
+_ARGS_FMT_RE = re.compile(r"^[A-Za-z0-9 {}:%._,\-]{0,80}$")
+_URL_RE = re.compile(r"(?i)\b(?:ws|http)s?://\S+")
+
 
 def ensure_target_confirmed(reported_f, requested_f, label: str) -> None:
     """Raise unless a later read shows the Fahrenheit target that was sent."""
@@ -42,6 +58,81 @@ def ensure_target_confirmed(reported_f, requested_f, label: str) -> None:
         raise BroilKingError(
             f"{label} {requested} F was not confirmed; grill reports {reported_f} F"
         )
+
+
+def sanitize_method_names(raw) -> tuple[list[str], int]:
+    """Keep short RPC names and count everything else as omitted.
+
+    Names that identify filesystem, configuration, or credential methods are
+    omitted rather than returned. The caller must not invent names.
+    """
+    if not isinstance(raw, list):
+        return [], 0
+    kept: list[str] = []
+    omitted = 0
+    seen: set[str] = set()
+    for item in raw:
+        name = item.get("name") if isinstance(item, dict) else item
+        if not isinstance(name, str):
+            omitted += 1
+            continue
+        folded = name.lower()
+        if (
+            not _NAME_RE.fullmatch(name)
+            or _SECRET_RE.search(name)
+            or folded in seen
+        ):
+            omitted += 1
+            continue
+        seen.add(folded)
+        if len(kept) >= _MAX_METHOD_NAMES:
+            omitted += 1
+            continue
+        kept.append(name)
+    kept.sort(key=str.lower)
+    return kept, omitted
+
+
+def describe_targets(names: list[str]) -> list[str]:
+    """Names from this list that are safe to pass to RPC.Describe.
+
+    At most one today: the documented SendGenericCommand method, and only
+    when it is actually in ``names``. Capped at three.
+    """
+    found = [name for name in names if name.lower() == _DOCUMENTED_CONTROL_METHOD.lower()]
+    return found[:3]
+
+
+def public_rpc_text(payload) -> str:
+    """Short error text with URLs removed. Dict payloads are not echoed."""
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        text = message if isinstance(message, str) else "RPC rejected"
+    elif isinstance(payload, str):
+        text = payload
+    else:
+        text = "RPC rejected"
+    text = _URL_RE.sub("ws://grill", text)
+    text = " ".join(text.split())
+    if len(text) > 160:
+        text = text[:160]
+    return text
+
+
+def _sanitize_describe(requested: str, payload) -> dict:
+    """Keep only the requested name and a short args format."""
+    if not isinstance(payload, dict):
+        return {"name": requested, "args_fmt": None, "error": "unusable describe reply"}
+    args = payload.get("args_fmt")
+    if args is None:
+        return {"name": requested, "args_fmt": None}
+    if (
+        not isinstance(args, str)
+        or _ARGS_FMT_RE.fullmatch(args) is None
+        or _SECRET_RE.search(args)
+    ):
+        return {"name": requested, "args_fmt": "[redacted]"}
+    return {"name": requested, "args_fmt": args}
 
 
 def _payload_suffix(payload) -> str:
@@ -79,7 +170,7 @@ class BroilKingClient:
         self._last_warn = 0.0
 
     # ---- low level -----------------------------------------------------
-    async def _rpc(self, method: str, args: dict | None = None):
+    async def _rpc(self, method: str, args: dict | None = None, timeout: float = 10):
         self._id += 1
         rid = self._id
         frame: dict = {"method": method, "id": rid}
@@ -87,7 +178,7 @@ class BroilKingClient:
             frame["args"] = args
         url = f"ws://{self._host}/rpc"
         try:
-            async with self._session.ws_connect(url, timeout=10) as ws:
+            async with self._session.ws_connect(url, timeout=timeout) as ws:
                 await ws.send_str(json.dumps(frame))
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
@@ -146,6 +237,55 @@ class BroilKingClient:
             self._last_warn = now
             _LOGGER.warning("GetAllValues unusable (code=%s)", self._last_code)
         raise BroilKingError("unusable GetAllValues reply")
+
+    async def async_discover_commands(self) -> dict:
+        """Read RPC.List once, then describe at most the documented control method.
+
+        Registered explicitly by the integration service. Not used during
+        polling or startup. Never calls FS.Get, Config.Get, or a setpoint write.
+        """
+        result = {
+            "ok": False,
+            "error": "",
+            "methods": [],
+            "described": [],
+            "omitted_count": 0,
+        }
+        try:
+            ok, payload = await self._rpc("RPC.List", timeout=DISCOVER_TIMEOUT)
+        except BroilKingError as exc:
+            result["error"] = public_rpc_text(str(exc))
+            return result
+        if not ok or not isinstance(payload, list):
+            result["error"] = public_rpc_text(payload if not ok else "unusable RPC.List reply")
+            return result
+        methods, omitted = sanitize_method_names(payload)
+        result["ok"] = True
+        result["methods"] = methods
+        result["omitted_count"] = omitted
+        for name in describe_targets(methods):
+            try:
+                described_ok, described = await self._rpc(
+                    "RPC.Describe",
+                    {"name": name},
+                    timeout=DISCOVER_TIMEOUT,
+                )
+            except BroilKingError as exc:
+                result["described"].append(
+                    {"name": name, "args_fmt": None, "error": public_rpc_text(str(exc))}
+                )
+                break
+            if not described_ok:
+                result["described"].append(
+                    {
+                        "name": name,
+                        "args_fmt": None,
+                        "error": public_rpc_text(described),
+                    }
+                )
+                continue
+            result["described"].append(_sanitize_describe(name, described))
+        return result
 
     # ---- control -------------------------------------------------------
     # Setpoints stay on the published SendGenericCommand frames (actions 1/2/3,
