@@ -280,7 +280,7 @@ class TargetWriteTests(unittest.IsolatedAsyncioTestCase):
         manifest = json.loads(
             (ROOT / "custom_components" / "broilking" / "manifest.json").read_text()
         )
-        self.assertEqual(manifest["version"], "0.1.4")
+        self.assertEqual(manifest["version"], "0.1.5")
 
     def test_conversion_and_display_round_trip(self):
         stub_homeassistant()

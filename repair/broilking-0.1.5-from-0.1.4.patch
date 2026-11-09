@@ -1,0 +1,55 @@
+--- a/__init__.py
++++ b/__init__.py
+@@ -1,7 +1,5 @@
+ """The Broil King Smoker integration."""
+ from __future__ import annotations
+-
+-import voluptuous as vol
+ 
+ from homeassistant.config_entries import ConfigEntry
+ from homeassistant.const import CONF_HOST, CONF_PASSWORD, Platform
+@@ -12,6 +10,7 @@
+ from .api import BroilKingClient
+ from .const import DOMAIN
+ from .coordinator import BroilKingCoordinator
++from .discover_schema import DISCOVER_SCHEMA
+ 
+ # On-demand RPC.List. The schema rejects every other field, including an RPC name.
+ SERVICE_DISCOVER = "discover_commands"
+@@ -68,10 +67,7 @@
+         DOMAIN,
+         SERVICE_DISCOVER,
+         _discover,
+-        schema=vol.Schema(
+-            {vol.Optional("entry_id"): str},
+-            extra=vol.PREVENT,
+-        ),
++        schema=DISCOVER_SCHEMA,
+         supports_response=SupportsResponse.OPTIONAL,
+     )
+ 
+--- a/manifest.json
++++ b/manifest.json
+@@ -7,5 +7,5 @@
+   "iot_class": "local_polling",
+   "issue_tracker": "https://github.com/bbirke/broilking-homeassistant/issues",
+   "requirements": [],
+-  "version": "0.1.4"
++  "version": "0.1.5"
+ }
+--- /dev/null
++++ b/discover_schema.py
+@@ -0,0 +1,13 @@
++"""Schema for broilking.discover_commands.
++
++Home Assistant 2026.11 aliases ``voluptuous`` to ``probatio._vol_shim``.
++That module has ``PREVENT_EXTRA`` and does not have ``PREVENT``.
++"""
++from __future__ import annotations
++
++import voluptuous as vol
++
++DISCOVER_SCHEMA = vol.Schema(
++    {vol.Optional("entry_id"): str},
++    extra=vol.PREVENT_EXTRA,
++)

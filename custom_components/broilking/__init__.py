@@ -1,8 +1,6 @@
 """The Broil King Smoker integration."""
 from __future__ import annotations
 
-import voluptuous as vol
-
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, Platform
 from homeassistant.core import HomeAssistant, SupportsResponse
@@ -12,6 +10,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import BroilKingClient
 from .const import DOMAIN
 from .coordinator import BroilKingCoordinator
+from .discover_schema import DISCOVER_SCHEMA
 
 # On-demand RPC.List. The schema rejects every other field, including an RPC name.
 SERVICE_DISCOVER = "discover_commands"
@@ -68,10 +67,7 @@ def _async_ensure_discover_service(hass: HomeAssistant) -> None:
         DOMAIN,
         SERVICE_DISCOVER,
         _discover,
-        schema=vol.Schema(
-            {vol.Optional("entry_id"): str},
-            extra=vol.PREVENT,
-        ),
+        schema=DISCOVER_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
     )
 
