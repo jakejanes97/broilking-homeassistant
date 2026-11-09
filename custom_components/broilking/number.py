@@ -92,9 +92,9 @@ class BroilKingCookTimer(BroilKingEntity, NumberEntity):
 class BroilKingProbeTarget(BroilKingEntity, NumberEntity):
     """Target temperature of a meat probe, in degrees C.
 
-    Two-way like the cook timer: writing sends the setpoint to the control board
-    (action 2 / 3, Fahrenheit) and the grill reports it back in
-    probe_<n>_Set_Temp, so a target set on the grill's panel shows up here too.
+    Writing sends action 2 / 3 in Fahrenheit. The typed value is not published
+    locally: the client raises unless the grill's next read echoes it in
+    probe_<n>_Set_Temp. A target set on the grill's panel still shows up here.
     """
 
     _attr_device_class = NumberDeviceClass.TEMPERATURE
@@ -109,24 +109,16 @@ class BroilKingProbeTarget(BroilKingEntity, NumberEntity):
         super().__init__(coordinator, f"probe_{probe}_target_set")
         self._probe = probe
         self._attr_name = f"Probe {probe} Target Temperature"
-        self._pending: float | None = None
 
     @property
     def native_value(self) -> float | None:
-        if self._pending is not None:
-            return self._pending
         return f_to_c(self._data.get(f"probe_{self._probe}_Set_Temp"))
 
     async def async_set_native_value(self, value: float) -> None:
+        # The client confirms the Fahrenheit echo before returning. Publishing
+        # `value` here made a write that the grill did not keep look accepted
+        # for BOARD_ACK_DELAY, which is the brief flash back to the old target.
         await self.coordinator.client.async_set_probe_target_f(
             self._probe, c_to_f(value)
         )
-
-        self._pending = float(value)
-        self.async_write_ha_state()
-        try:
-            await asyncio.sleep(BOARD_ACK_DELAY)
-            await self.coordinator.async_refresh()
-        finally:
-            self._pending = None
-            self.async_write_ha_state()
+        await self.coordinator.async_refresh()

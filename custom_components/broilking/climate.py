@@ -68,8 +68,10 @@ class BroilKingGrill(BroilKingEntity, ClimateEntity):
         temp_c = kwargs.get(ATTR_TEMPERATURE)
         if temp_c is None:
             return
+        # Raises unless SendGenericCommand is accepted and the next read echoes
+        # this Fahrenheit setpoint. Preset, power, and timer paths are unchanged.
         await self.coordinator.client.async_set_grill_target_f(c_to_f(temp_c))
-        await self.coordinator.async_request_refresh()
+        await self.coordinator.async_refresh()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         mode_id = MODE_IDS.get(preset_mode)

@@ -16,6 +16,21 @@ ranges, command codes, or reported fields may differ on other models.
 Use at your own risk: this integration can change your grill's setpoint and mode.
 Not affiliated with or endorsed by Broil King / Onward Manufacturing.
 
+## This fork
+
+Reads use `GetAllValues` with no arguments. Grill and probe target writes still
+use the `SendGenericCommand` frames in the protocol table, in Fahrenheit. Those
+calls fail if the firmware rejects the frame or the next read does not echo the
+new setpoint, and the failure is a Home Assistant service error. Firmware that
+answers `No handler for SendGenericCommand` has not registered that method, so
+the frame bytes are not a setpoint write on that firmware. No other target-write
+method is documented for it. `SendCustomCommand` is not used. Timer, mode, and
+power behavior is unchanged, and temperatures stay Celsius in Home Assistant.
+
+`broilking.discover_commands` calls `RPC.List` once on the configured grill.
+The service accepts no RPC method name. It calls `RPC.Describe` only when that
+list contains `SendGenericCommand`. It does not call `FS.Get` or `Config.Get`.
+
 ## Install (HACS)
 
 1. HACS -> Integrations -> three-dot menu -> **Custom repositories** -> add this

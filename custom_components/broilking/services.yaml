@@ -1,0 +1,17 @@
+discover_commands:
+  name: Discover commands
+  description: >-
+    Read RPC.List once through the grill already configured for this
+    integration. If that list contains SendGenericCommand, also read
+    RPC.Describe for that name only. Does not accept an RPC method, and does
+    not change temperature, mode, timer, or power.
+  fields:
+    entry_id:
+      name: Config entry id
+      description: >-
+        Optional. Required only when more than one Broil King config entry is
+        loaded. This is a Home Assistant config entry id, not a hostname and
+        not an RPC method.
+      required: false
+      selector:
+        text:

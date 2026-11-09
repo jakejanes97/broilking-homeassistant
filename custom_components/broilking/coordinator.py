@@ -15,7 +15,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class BroilKingCoordinator(DataUpdateCoordinator[dict]):
-    """Polls GetCurrentTemperatures and shares the raw state dict."""
+    """Polls grill state and shares the raw dict."""
 
     def __init__(self, hass: HomeAssistant, client: BroilKingClient, device_id: str):
         super().__init__(
