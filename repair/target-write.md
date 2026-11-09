@@ -1,43 +1,50 @@
-# 0.1.6 after an in-memory Home Assistant 2026.11 run
+# 0.1.7 discovery bounds and safe errors
 
-The device is still on 0.1.4, which fails setup because `vol.PREVENT` does not exist. 0.1.6 is the tree that was loaded into Home Assistant 2026.11.0. It includes the `PREVENT_EXTRA` schema and a reply timeout that actually ends a silent websocket. The setpoint is still not fixed. `climate.py`, `number.py`, `coordinator.py`, and `services.yaml` are unchanged.
+Installed 0.1.4 still fails setup on `vol.PREVENT`. 0.1.6 fixed that and the silent-after-handshake case, and QA held it: a TCP accept with no HTTP stayed open past 15 seconds, a refused connection returned the address, a lowercase `sendgenericcommand` was described, and a token planted in a device error was copied into the service result. 0.1.7 is the tree checked against Home Assistant 2026.11.0. The setpoint is still not fixed.
 
-## What was installed for the check
+## What changed
+
+Discovery no longer uses aiohttp for `RPC.List` or `RPC.Describe`. aiohttp 3.14 does not end a websocket handshake when TCP is accepted and no HTTP arrives, and cancelling `ws_connect` did not return in a direct check. Each discovery call now opens its own asyncio socket. The 8 second deadline covers the TCP connect, the HTTP upgrade, the reply, and aborting the socket. There is no retry.
+
+The service result uses fixed words: `timeout`, `connection_failed`, `rejected`, `no_reply`, `unusable_reply`, or the exact sentence `No handler for RPC.List` when the device text is that sentence and nothing more. Socket text and other device text are not copied into the result or this component's log.
+
+`RPC.Describe` runs only when the list contains the exact spelling `SendGenericCommand`. `sendgenericcommand` is left in the method list and is not described.
+
+`GetAllValues` still uses the existing aiohttp read, the same key mapping, and the same 10 second reply wait. Climate, number, coordinator, and `services.yaml` are unchanged. No target, power, mode, or timer write was added.
+
+## Checks
+
+Python 3.12.3, without the Home Assistant package:
+
+`python3 -m unittest tests.test_discover_transport tests.test_discover tests.test_target_write tests.test_ha202611_schema`
+
+35 tests, OK, 77.085s. This includes the localhost handshake stall, refused port, planted secret, mute peer, wrong-id flood, and cancellation.
+
+Python 3.14.10, homeassistant 2026.11.0, probatio 0.13.0, aiohttp 3.14.5:
+
+`/tmp/ha202611/bin/python -m unittest tests.test_discover_transport tests.test_discover tests.test_target_write tests.test_ha202611_schema tests.test_ha202611_runtime`
+
+36 tests, OK, 87.269s. The runtime test loads the component through `ConfigEntries.async_add` on an in-memory Home Assistant. The stand-in is `127.0.0.1` only. The entry reached `loaded`, empty data returned the discovery dict, an unknown `method` raised `probatio.Invalid`, `return_response=False` returned `None`, describe ran only for exact `SendGenericCommand`, a silent reply timed out without a retry, and unload removed the service.
+
+Commands used to build that environment:
 
 ```text
-uv 0.13.7
 uv python install 3.14
 uv venv /tmp/ha202611 --python 3.14
 uv pip install --python /tmp/ha202611/bin/python 'homeassistant==2026.11.0'
 ```
 
-That environment resolved to Python 3.14.10, homeassistant 2026.11.0, probatio 0.13.0, and aiohttp 3.14.5. Importing `homeassistant` aliases `voluptuous` to `probatio._vol_shim`. That module has `PREVENT_EXTRA` and does not have `PREVENT`.
+No external Home Assistant and no grill were contacted. Nothing was deployed.
 
-## What the in-memory instance did
+Home Assistant still logs that the unchanged climate entity uses `_attr_temperature_unit`, `current_temperature`, and `target_temperature`, which core says stop working in 2027.11. The entities were created.
 
-`/tmp/ha202611/bin/python -m unittest tests.test_ha202611_runtime -v` loaded this component through Home Assistant's config-entry setup. Registries, the frame helper, and the network component were the real ones. The grill was a stand-in bound to `127.0.0.1` on a random port. Nothing connected to an external Home Assistant or to the grill.
-
-Result: 1 test, OK, about 10 seconds.
-
-- Config entry state was `loaded`.
-- `broilking.discover_commands` was registered with `supports_response` `optional`.
-- `{}` with `return_response=True` returned the discovery dict. `FS.Get` and `Config.Get` were omitted. The host and password were not in the response. The stand-in saw one `RPC.List` and no `SendGenericCommand`, `FS.Get`, or `Config.Get`.
-- `{"method": "FS.Get"}` raised `probatio.Invalid` inside `ServiceRegistry.async_call` before another list call.
-- The same action with `return_response=False` returned `None`.
-- When the stand-in then listed `SendGenericCommand`, the next call described only that name.
-- A stand-in that accepted `RPC.List` and then stayed silent made the action return `ok: false` with `RPC RPC.List timed out` in under 12 seconds, and that list was not retried.
-- Unloading the config entry removed the service.
-- Setup still reads with `GetAllValues`. The stand-in answered that read.
-
-aiohttp 3.14 does not treat a float `timeout` as a reply deadline, and `ClientWSTimeout.ws_receive` also did not stop the silent peer in a direct check. 0.1.6 therefore wraps the read in `asyncio.wait_for` for the same 8 second discovery limit and the existing 10 second read limit. A prompt reply is unchanged.
-
-Home Assistant logged that `BroilKingGrill` still uses `_attr_temperature_unit`, `current_temperature`, and `target_temperature`, which it says stop working in 2027.11. Those entities were still created. This build does not change them.
-
-`python3 -m unittest tests.test_ha202611_schema tests.test_target_write tests.test_discover` on Python 3.12.3 passed 32 tests. That interpreter cannot import homeassistant 2026.11.0. The runtime test above is the one that used the real service registry.
+`GetAllValues` still goes through the shared Home Assistant aiohttp session. A temperature poll against a peer that accepts TCP and never sends HTTP can still sit on that session's connect timeout. Discovery does not use that path.
 
 ## Install on the current 0.1.4 files
 
-Apply only `repair/broilking-0.1.6-from-0.1.4.patch` with `patch -p1` from the component directory. Do not apply the 0.1.5 patch first. `backup_pre_0.1.4` remains the 0.1.2 rollback.
+Apply only `repair/broilking-0.1.7-from-0.1.4.patch` with `patch -p1` from the component directory. Do not apply the 0.1.5 or 0.1.6 patch first. `backup_pre_0.1.4` is the 0.1.2 rollback.
+
+Patch SHA-256: `a70001cc2b010423155cab7152ae802c6946d10811110284e7bfc1dfc882ddc1`
 
 Hashes that must match before the patch:
 
@@ -51,13 +58,13 @@ aabc62de38f01c30887e1d520035b601b0a2562c2c114bbe1e7e873b3032f266  api.py
 `services.yaml`, `climate.py`, `number.py`, and `coordinator.py` stay as they are. After the patch:
 
 ```
-77da1f2589b05ce0cdafe7ddb50880b71f28935af17b87b4f9d6e903fc2a812f  api.py
+73fa0f7b79b59d8c70107417408867ea4568225b1573bb6d5ccfff1904796d0b  api.py
 b779f3516b4404fc5db33c5e2403d95ac52b1454e34240a0c0eb077ac49d3079  __init__.py
-e739172ac2e9a062ce56b4737e5e37555d57fa06757471c83465168111fef288  manifest.json
+fcad92c02410c8ab877ce63b4355c1eaaf810a9148aa0112c627f8788dc17d25  manifest.json
 17d78bf847a47a0728746c4adfa11a2216ec89c11ad68a1d54e3f8120f8d3f98  discover_schema.py
 ```
 
-Manifest version is `0.1.6`. The archive is `repair/broilking-target-repair.tar.gz`. From the extracted directory, `sha256sum -c repair/SHA256SUMS`.
+Manifest version is `0.1.7`. The archive is `repair/broilking-target-repair.tar.gz`. From the extracted directory, `sha256sum -c repair/SHA256SUMS`.
 
 Restart Home Assistant once. Then run `broilking.discover_commands` with no data. Do not call `number.set_value`, `climate.set_temperature`, `climate.set_hvac_mode`, or `climate.set_preset_mode`.
 
@@ -71,4 +78,4 @@ Restart Home Assistant once. Then run `broilking.discover_commands` with no data
 }
 ```
 
-`described` stays empty unless the list contains `SendGenericCommand`. A missing `RPC.List` returns `ok: false` and `error: "No handler for RPC.List"` after one call.
+`described` stays empty unless the list contains the exact name `SendGenericCommand`. A missing list method returns `error` `No handler for RPC.List`. A refused connection returns `connection_failed`. A silent or half-open connection returns `timeout`.

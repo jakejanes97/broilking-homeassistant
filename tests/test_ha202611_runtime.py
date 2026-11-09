@@ -245,9 +245,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             timeout=12,
         )
         elapsed = time.monotonic() - started
+        self.assertEqual(stalled["error"], "timeout")
         self.assertFalse(stalled["ok"])
         self.assertGreaterEqual(elapsed, 7)
-        self.assertLess(elapsed, 12)
+        self.assertLess(elapsed, 9.5)
+        self.assertNotIn(self.grill.host, json.dumps(stalled))
         # Answered lists plus one silent list, with no retry of the silence.
         self.assertEqual(self.grill.methods.count("RPC.List"), 4)
 

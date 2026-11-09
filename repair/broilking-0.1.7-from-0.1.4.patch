@@ -1,0 +1,462 @@
+--- a/api.py
++++ b/api.py
+@@ -10,8 +10,11 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import base64
++import hashlib
+ import json
+ import logging
++import os
+ import re
+ import time
+ 
+@@ -25,10 +28,12 @@
+ class BroilKingError(HomeAssistantError):
+     """Raised when the smoker cannot be reached or returns an error.
+ 
+-    Service calls see this as a Home Assistant device error. A missing RPC
+-    method is that kind of failure: the requested Fahrenheit value was in
+-    range, and the firmware rejected the method.
++    ``public_code`` is safe to show. It is not the device's own text.
+     """
++
++    def __init__(self, message: str, *, public_code: str = "failed") -> None:
++        super().__init__(message)
++        self.public_code = public_code
+ 
+ 
+ # Same pause the cook-timer number uses before trusting a read-back.
+@@ -76,15 +81,14 @@
+         if not isinstance(name, str):
+             omitted += 1
+             continue
+-        folded = name.lower()
+         if (
+             not _NAME_RE.fullmatch(name)
+             or _SECRET_RE.search(name)
+-            or folded in seen
++            or name in seen
+         ):
+             omitted += 1
+             continue
+-        seen.add(folded)
++        seen.add(name)
+         if len(kept) >= _MAX_METHOD_NAMES:
+             omitted += 1
+             continue
+@@ -94,13 +98,13 @@
+ 
+ 
+ def describe_targets(names: list[str]) -> list[str]:
+-    """Names from this list that are safe to pass to RPC.Describe.
+-
+-    At most one today: the documented SendGenericCommand method, and only
+-    when it is actually in ``names``. Capped at three.
++    """The documented control name, only with that exact spelling.
++
++    ``sendgenericcommand`` is not described. A listed name is never invented.
+     """
+-    found = [name for name in names if name.lower() == _DOCUMENTED_CONTROL_METHOD.lower()]
+-    return found[:3]
++    if _DOCUMENTED_CONTROL_METHOD in names:
++        return [_DOCUMENTED_CONTROL_METHOD]
++    return []
+ 
+ 
+ def public_rpc_text(payload) -> str:
+@@ -148,6 +152,98 @@
+     return f": {text}"
+ 
+ 
++_WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
++_MAX_WS_PAYLOAD = 65536
++
++
++def _split_host(host: str) -> tuple[str, int]:
++    if host.startswith("[") and "]" in host:
++        name, _, rest = host[1:].partition("]")
++        if rest.startswith(":") and rest[1:].isdigit():
++            return name, int(rest[1:])
++        return name, 80
++    if host.count(":") == 1:
++        name, port_text = host.split(":", 1)
++        if port_text.isdigit():
++            return name, int(port_text)
++    return host, 80
++
++
++def _remaining(deadline: float) -> float:
++    left = deadline - time.monotonic()
++    if left <= 0:
++        raise TimeoutError
++    return left
++
++
++def _public_device_error(method: str, payload) -> str:
++    """A fixed phrase. Device text is not copied unless it is that phrase."""
++    expected = f"No handler for {method}"
++    if payload == expected:
++        return expected
++    return "rejected"
++
++
++def _ws_client_frame(opcode: int, payload: bytes) -> bytes:
++    mask = os.urandom(4)
++    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
++    length = len(payload)
++    if length < 126:
++        header = bytes((0x80 | opcode, 0x80 | length))
++    elif length <= _MAX_WS_PAYLOAD:
++        header = bytes((0x80 | opcode, 0x80 | 126)) + length.to_bytes(2, "big")
++    else:
++        raise BroilKingError("unusable_reply", public_code="unusable_reply")
++    return header + mask + masked
++
++
++async def _read_exact(reader: asyncio.StreamReader, size: int, deadline: float) -> bytes:
++    return await asyncio.wait_for(reader.readexactly(size), _remaining(deadline))
++
++
++async def _read_ws_message(
++    reader: asyncio.StreamReader,
++    writer: asyncio.StreamWriter,
++    deadline: float,
++) -> bytes:
++    chunks: list[bytes] = []
++    while True:
++        first, second = await _read_exact(reader, 2, deadline)
++        opcode = first & 0x0F
++        masked = bool(second & 0x80)
++        length = second & 0x7F
++        if length == 126:
++            length = int.from_bytes(await _read_exact(reader, 2, deadline), "big")
++        elif length == 127:
++            length = int.from_bytes(await _read_exact(reader, 8, deadline), "big")
++        if length > _MAX_WS_PAYLOAD:
++            raise BroilKingError("unusable_reply", public_code="unusable_reply")
++        mask = await _read_exact(reader, 4, deadline) if masked else b""
++        data = await _read_exact(reader, length, deadline) if length else b""
++        if masked:
++            data = bytes(byte ^ mask[index % 4] for index, byte in enumerate(data))
++        if opcode == 0x8:
++            raise BroilKingError("no_reply", public_code="no_reply")
++        if opcode == 0x9:
++            writer.write(_ws_client_frame(0xA, data))
++            await asyncio.wait_for(writer.drain(), _remaining(deadline))
++            continue
++        if opcode in (0x0, 0x1):
++            chunks.append(data)
++            if first & 0x80:
++                return b"".join(chunks)
++            continue
++
++
++def _abort_writer(writer: asyncio.StreamWriter | None) -> None:
++    if writer is None:
++        return
++    transport = writer.transport
++    writer.close()
++    if transport is not None:
++        transport.abort()
++
++
+ class BroilKingClient:
+     """Stateless-per-call RPC client (one short WebSocket per request)."""
+ 
+@@ -177,29 +273,41 @@
+         if args is not None:
+             frame["args"] = args
+         url = f"ws://{self._host}/rpc"
++        # aiohttp 3.14 applies a float only to websocket close, and
++        # ClientWSTimeout.ws_receive did not stop a peer that accepted the
++        # handshake and then stayed silent. wait_for is the bound that does.
++        ws_timeout = aiohttp.ClientWSTimeout(ws_close=timeout, ws_receive=timeout)
+         try:
+-            async with self._session.ws_connect(url, timeout=timeout) as ws:
++            async with self._session.ws_connect(url, timeout=ws_timeout) as ws:
+                 await ws.send_str(json.dumps(frame))
+-                async for msg in ws:
+-                    if msg.type == aiohttp.WSMsgType.TEXT:
+-                        resp = json.loads(msg.data)
+-                        if resp.get("id") != rid:
+-                            continue
+-                        err = resp.get("error")
+-                        self._last_code = err.get("code") if isinstance(err, dict) else None
+-                        if err is None:
+-                            return True, resp.get("result")
+-                        raw = err.get("message", "")
+-                        try:
+-                            payload = json.loads(raw)
+-                        except (ValueError, TypeError):
+-                            payload = raw
+-                        return err.get("code", -1) == 0, payload
+-                    if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+-                        break
+-        except (aiohttp.ClientError, OSError, TimeoutError) as exc:
++
++                async def _read_reply():
++                    async for msg in ws:
++                        if msg.type == aiohttp.WSMsgType.TEXT:
++                            resp = json.loads(msg.data)
++                            if resp.get("id") != rid:
++                                continue
++                            err = resp.get("error")
++                            self._last_code = err.get("code") if isinstance(err, dict) else None
++                            if err is None:
++                                return True, resp.get("result")
++                            raw = err.get("message", "")
++                            try:
++                                payload = json.loads(raw)
++                            except (ValueError, TypeError):
++                                payload = raw
++                            return err.get("code", -1) == 0, payload
++                        if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
++                            break
++                    raise BroilKingError(f"no reply to {method}")
++
++                return await asyncio.wait_for(_read_reply(), timeout)
++        except BroilKingError:
++            raise
++        except TimeoutError as exc:
++            raise BroilKingError(f"RPC {method} timed out") from exc
++        except (aiohttp.ClientError, OSError) as exc:
+             raise BroilKingError(f"RPC {method} failed: {exc}") from exc
+-        raise BroilKingError(f"no reply to {method}")
+ 
+     # ---- reads ---------------------------------------------------------
+     async def async_get_info(self) -> dict:
+@@ -238,54 +346,136 @@
+             _LOGGER.warning("GetAllValues unusable (code=%s)", self._last_code)
+         raise BroilKingError("unusable GetAllValues reply")
+ 
+-    async def async_discover_commands(self) -> dict:
+-        """Read RPC.List once, then describe at most the documented control method.
+-
+-        Registered explicitly by the integration service. Not used during
+-        polling or startup. Never calls FS.Get, Config.Get, or a setpoint write.
+-        """
+-        result = {
++    def _discover_failure(self, code: str) -> dict:
++        return {
+             "ok": False,
+-            "error": "",
++            "error": code,
+             "methods": [],
+             "described": [],
+             "omitted_count": 0,
+         }
++
++    async def _bounded_rpc(self, method: str, args: dict | None, deadline: float):
++        """One RPC over asyncio streams. The deadline covers connect and close."""
++        self._id += 1
++        rid = self._id
++        frame = {"method": method, "id": rid}
++        if args is not None:
++            frame["args"] = args
++        host, port = _split_host(self._host)
++        writer: asyncio.StreamWriter | None = None
+         try:
+-            ok, payload = await self._rpc("RPC.List", timeout=DISCOVER_TIMEOUT)
++            reader, writer = await asyncio.wait_for(
++                asyncio.open_connection(host, port),
++                _remaining(deadline),
++            )
++            key = base64.b64encode(os.urandom(16)).decode()
++            request = (
++                "GET /rpc HTTP/1.1\r\n"
++                f"Host: {host}\r\n"
++                "Upgrade: websocket\r\n"
++                "Connection: Upgrade\r\n"
++                "Sec-WebSocket-Version: 13\r\n"
++                f"Sec-WebSocket-Key: {key}\r\n"
++                "\r\n"
++            )
++            writer.write(request.encode())
++            await asyncio.wait_for(writer.drain(), _remaining(deadline))
++            status = await asyncio.wait_for(reader.readline(), _remaining(deadline))
++            if not status.startswith(b"HTTP/1.1 101") and not status.startswith(b"HTTP/1.0 101"):
++                raise BroilKingError("connection_failed", public_code="connection_failed")
++            accept = ""
++            for _ in range(40):
++                line = await asyncio.wait_for(reader.readline(), _remaining(deadline))
++                if line in (b"\r\n", b"\n", b""):
++                    break
++                if line.lower().startswith(b"sec-websocket-accept:"):
++                    accept = line.split(b":", 1)[1].strip().decode("ascii", "replace")
++            else:
++                raise BroilKingError("connection_failed", public_code="connection_failed")
++            expected = base64.b64encode(
++                hashlib.sha1(key.encode() + _WS_GUID).digest()
++            ).decode()
++            if accept != expected:
++                raise BroilKingError("connection_failed", public_code="connection_failed")
++            writer.write(_ws_client_frame(0x1, json.dumps(frame).encode()))
++            await asyncio.wait_for(writer.drain(), _remaining(deadline))
++            while True:
++                message = await _read_ws_message(reader, writer, deadline)
++                try:
++                    resp = json.loads(message)
++                except (ValueError, TypeError):
++                    raise BroilKingError(
++                        "unusable_reply", public_code="unusable_reply"
++                    ) from None
++                if not isinstance(resp, dict) or resp.get("id") != rid:
++                    continue
++                err = resp.get("error")
++                self._last_code = err.get("code") if isinstance(err, dict) else None
++                if err is None:
++                    return True, resp.get("result")
++                raw = err.get("message", "") if isinstance(err, dict) else ""
++                try:
++                    payload = json.loads(raw)
++                except (ValueError, TypeError):
++                    payload = raw
++                return err.get("code", -1) == 0, payload
++        except BroilKingError:
++            raise
++        except TimeoutError:
++            raise BroilKingError("timeout", public_code="timeout") from None
++        except asyncio.IncompleteReadError:
++            raise BroilKingError("no_reply", public_code="no_reply") from None
++        except OSError:
++            raise BroilKingError(
++                "connection_failed", public_code="connection_failed"
++            ) from None
++        finally:
++            _abort_writer(writer)
++
++    async def async_discover_commands(self) -> dict:
++        """Read RPC.List once, then describe only exact SendGenericCommand.
++
++        The 8 second deadline includes the TCP connection, the HTTP upgrade,
++        the reply, and closing the socket. There is no retry. The service
++        result uses fixed error words, not text from the device or the socket.
++        """
++        deadline = time.monotonic() + DISCOVER_TIMEOUT
++        try:
++            ok, payload = await self._bounded_rpc("RPC.List", None, deadline)
+         except BroilKingError as exc:
+-            result["error"] = public_rpc_text(str(exc))
+-            return result
++            return self._discover_failure(exc.public_code)
+         if not ok or not isinstance(payload, list):
+-            result["error"] = public_rpc_text(payload if not ok else "unusable RPC.List reply")
+-            return result
++            return self._discover_failure(_public_device_error("RPC.List", payload))
+         methods, omitted = sanitize_method_names(payload)
+-        result["ok"] = True
+-        result["methods"] = methods
+-        result["omitted_count"] = omitted
++        described = []
+         for name in describe_targets(methods):
+             try:
+-                described_ok, described = await self._rpc(
+-                    "RPC.Describe",
+-                    {"name": name},
+-                    timeout=DISCOVER_TIMEOUT,
++                described_ok, body = await self._bounded_rpc(
++                    "RPC.Describe", {"name": name}, deadline
+                 )
+             except BroilKingError as exc:
+-                result["described"].append(
+-                    {"name": name, "args_fmt": None, "error": public_rpc_text(str(exc))}
++                described.append(
++                    {"name": name, "args_fmt": None, "error": exc.public_code}
+                 )
+                 break
+             if not described_ok:
+-                result["described"].append(
++                described.append(
+                     {
+                         "name": name,
+                         "args_fmt": None,
+-                        "error": public_rpc_text(described),
++                        "error": _public_device_error("RPC.Describe", body),
+                     }
+                 )
+                 continue
+-            result["described"].append(_sanitize_describe(name, described))
+-        return result
++            described.append(_sanitize_describe(name, body))
++        return {
++            "ok": True,
++            "error": "",
++            "methods": methods,
++            "described": described,
++            "omitted_count": omitted,
++        }
+ 
+     # ---- control -------------------------------------------------------
+     # Setpoints stay on the published SendGenericCommand frames (actions 1/2/3,
+@@ -322,9 +512,12 @@
+ 
+     async def _require_target(self, ok: bool, payload, label: str, temp_f: int):
+         if not ok:
++            if payload == "No handler for SendGenericCommand":
++                detail = payload
++            else:
++                detail = "rejected"
+             raise BroilKingError(
+-                f"{label} {int(temp_f)} F rejected by SendGenericCommand"
+-                + _payload_suffix(payload)
++                f"{label} {int(temp_f)} F rejected by SendGenericCommand: {detail}"
+             )
+         return ok, payload
+ 
+--- a/__init__.py
++++ b/__init__.py
+@@ -1,7 +1,5 @@
+ """The Broil King Smoker integration."""
+ from __future__ import annotations
+-
+-import voluptuous as vol
+ 
+ from homeassistant.config_entries import ConfigEntry
+ from homeassistant.const import CONF_HOST, CONF_PASSWORD, Platform
+@@ -12,6 +10,7 @@
+ from .api import BroilKingClient
+ from .const import DOMAIN
+ from .coordinator import BroilKingCoordinator
++from .discover_schema import DISCOVER_SCHEMA
+ 
+ # On-demand RPC.List. The schema rejects every other field, including an RPC name.
+ SERVICE_DISCOVER = "discover_commands"
+@@ -68,10 +67,7 @@
+         DOMAIN,
+         SERVICE_DISCOVER,
+         _discover,
+-        schema=vol.Schema(
+-            {vol.Optional("entry_id"): str},
+-            extra=vol.PREVENT,
+-        ),
++        schema=DISCOVER_SCHEMA,
+         supports_response=SupportsResponse.OPTIONAL,
+     )
+ 
+--- a/manifest.json
++++ b/manifest.json
+@@ -7,5 +7,5 @@
+   "iot_class": "local_polling",
+   "issue_tracker": "https://github.com/bbirke/broilking-homeassistant/issues",
+   "requirements": [],
+-  "version": "0.1.4"
++  "version": "0.1.7"
+ }
+--- /dev/null
++++ b/discover_schema.py
+@@ -0,0 +1,13 @@
++"""Schema for broilking.discover_commands.
++
++Home Assistant 2026.11 aliases ``voluptuous`` to ``probatio._vol_shim``.
++That module has ``PREVENT_EXTRA`` and does not have ``PREVENT``.
++"""
++from __future__ import annotations
++
++import voluptuous as vol
++
++DISCOVER_SCHEMA = vol.Schema(
++    {vol.Optional("entry_id"): str},
++    extra=vol.PREVENT_EXTRA,
++)

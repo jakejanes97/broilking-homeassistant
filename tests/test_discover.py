@@ -32,10 +32,6 @@ HOST = "192.0.2.8"
 SECRET = "secret-token"
 
 
-def _listed(names):
-    return {"result": names}
-
-
 class DiscoverTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.api = load("api")
@@ -71,13 +67,13 @@ class DiscoverTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         self.assertEqual(
-            names, ["GetAllValues", "SendGenericCommand", "Sys.GetInfo"]
+            names,
+            ["GetAllValues", "SendGenericCommand", "sendgenericcommand", "Sys.GetInfo"],
         )
-        self.assertGreaterEqual(omitted, 8)
+        self.assertGreaterEqual(omitted, 7)
         self.assertNotIn(SECRET, json.dumps(names))
-        self.assertEqual(
-            api.describe_targets(names), ["SendGenericCommand"]
-        )
+        self.assertEqual(api.describe_targets(names), ["SendGenericCommand"])
+        self.assertEqual(api.describe_targets(["sendgenericcommand"]), [])
         self.assertEqual(
             api.describe_targets(
                 ["SendCustomCommand", "SetGrillTemp", "ProbeTarget8", "GetAllValues"]
@@ -132,111 +128,14 @@ class DiscoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('_rpc("Config.Get"', source)
         self.assertNotIn('_rpc("SendGenericCommand"', source)
         self.assertNotIn('_rpc("SendCustomCommand"', source)
-        self.assertEqual(source.count("await self._rpc("), 2)
+        self.assertEqual(source.count("await self._bounded_rpc("), 2)
+        self.assertNotIn("await self._rpc(", source)
 
     def test_unchanged_entity_files_match_012_baseline(self):
         directory = ROOT / "custom_components" / "broilking"
         for name, expected in BASELINE_012.items():
             digest = hashlib.sha256((directory / name).read_bytes()).hexdigest()
             self.assertEqual(digest, expected, name)
-
-    async def test_list_only_when_no_documented_control_method(self):
-        client = self.client(
-            [
-                _listed(
-                    [
-                        "GetAllValues",
-                        "Sys.GetInfo",
-                        "SendCustomCommand",
-                        "FS.Get",
-                        "Config.Get",
-                    ]
-                )
-            ],
-            password=SECRET,
-        )
-        client._host = HOST
-        result = await client.async_discover_commands()
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["error"], "")
-        self.assertEqual(
-            result["methods"],
-            ["GetAllValues", "SendCustomCommand", "Sys.GetInfo"],
-        )
-        self.assertEqual(result["described"], [])
-        self.assertEqual(result["omitted_count"], 2)
-        self.assertEqual(len(client._session.sent), 1)
-        frame = client._session.sent[0]
-        self.assertEqual(frame["method"], "RPC.List")
-        self.assertNotIn("args", frame)
-        recorded = client._session.timeouts[0]
-        self.assertEqual(len(client._session.timeouts), 1)
-        self.assertEqual(recorded.ws_receive, self.api.DISCOVER_TIMEOUT)
-        self.assertEqual(recorded.ws_close, self.api.DISCOVER_TIMEOUT)
-        blob = json.dumps(result)
-        self.assertNotIn(SECRET, blob)
-        self.assertNotIn(HOST, blob)
-        self.assertNotIn("FS.Get", blob)
-        self.assertNotIn("Config.Get", blob)
-
-    async def test_describe_only_documented_method_from_the_list(self):
-        client = self.client(
-            [
-                _listed(
-                    [
-                        "SendCustomCommand",
-                        "SendGenericCommand",
-                        "FS.Get",
-                        "SetGrillTemp",
-                    ]
-                ),
-                rpc_ok({"name": "SendGenericCommand", "args_fmt": "{command: %Q}"}),
-            ]
-        )
-        result = await client.async_discover_commands()
-        self.assertEqual(
-            [frame["method"] for frame in client._session.sent],
-            ["RPC.List", "RPC.Describe"],
-        )
-        self.assertEqual(
-            client._session.sent[1]["args"], {"name": "SendGenericCommand"}
-        )
-        self.assertNotIn("pass", client._session.sent[1]["args"])
-        self.assertEqual(
-            result["described"],
-            [{"name": "SendGenericCommand", "args_fmt": "{command: %Q}"}],
-        )
-        self.assertNotIn("SendCustomCommand", json.dumps(result["described"]))
-
-    async def test_missing_list_method_is_one_call(self):
-        client = self.client(
-            [{"error": {"code": 404, "message": "No handler for RPC.List"}}]
-        )
-        result = await client.async_discover_commands()
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["error"], "No handler for RPC.List")
-        self.assertEqual(result["methods"], [])
-        self.assertEqual(result["described"], [])
-        self.assertEqual(len(client._session.sent), 1)
-        recorded = client._session.timeouts[0]
-        self.assertEqual(len(client._session.timeouts), 1)
-        self.assertEqual(recorded.ws_receive, self.api.DISCOVER_TIMEOUT)
-        self.assertEqual(recorded.ws_close, self.api.DISCOVER_TIMEOUT)
-
-    async def test_timeout_does_not_retry_or_leak_host(self):
-        session = _TimeoutSession()
-        client = self.api.BroilKingClient(HOST, session, SECRET)
-        result = await client.async_discover_commands()
-        self.assertFalse(result["ok"])
-        recorded = session.calls[0]
-        self.assertEqual(len(session.calls), 1)
-        self.assertEqual(recorded.ws_receive, self.api.DISCOVER_TIMEOUT)
-        self.assertEqual(recorded.ws_close, self.api.DISCOVER_TIMEOUT)
-        blob = json.dumps(result)
-        self.assertNotIn(HOST, blob)
-        self.assertNotIn(SECRET, blob)
-        self.assertIn("RPC.List", result["error"])
-        self.assertIsInstance(self.api.BroilKingError("x"), HomeAssistantError)
 
     async def test_temperature_read_timeout_stays_ten_seconds(self):
         client = self.client([rpc_ok({"grillTemp": 1})])
@@ -245,15 +144,6 @@ class DiscoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recorded.ws_receive, 10)
         self.assertEqual(recorded.ws_close, 10)
         self.assertEqual(client._session.sent[0]["method"], "GetAllValues")
-
-
-class _TimeoutSession:
-    def __init__(self):
-        self.calls = []
-
-    def ws_connect(self, url, timeout=10):
-        self.calls.append(timeout)
-        raise TimeoutError(f"timed out talking to ws://{HOST}/rpc")
 
 
 def _function_body(func) -> str:

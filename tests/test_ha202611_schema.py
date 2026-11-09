@@ -93,8 +93,16 @@ class HomeAssistant202611SchemaTests(unittest.TestCase):
         self.assertIn("extra=vol.PREVENT_EXTRA", schema)
         self.assertNotRegex(schema, r"vol\.PREVENT(?!_EXTRA)")
 
-    def test_this_interpreter_does_not_import_homeassistant_2026_11(self):
-        """The full 2026.11 package requires Python >=3.14.2."""
-        self.assertLess(sys.version_info, (3, 14))
-        with self.assertRaises(ModuleNotFoundError):
-            import homeassistant  # noqa: F401
+    def test_homeassistant_import_matches_this_runtime(self):
+        """On 3.14, require the real 2026.11 package. Older Pythons are not that runtime."""
+        if sys.version_info < (3, 14):
+            module = sys.modules.get("homeassistant")
+            if module is not None and getattr(module, "__file__", None):
+                self.fail("Home Assistant 2026.11 is not supported on this Python")
+            return
+        import homeassistant
+        from homeassistant.const import REQUIRED_PYTHON_VER
+        from homeassistant.const import __version__ as ha_version
+
+        self.assertGreaterEqual(sys.version_info[:3], REQUIRED_PYTHON_VER)
+        self.assertEqual(ha_version, "2026.11.0")

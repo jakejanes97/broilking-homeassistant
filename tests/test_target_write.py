@@ -280,7 +280,7 @@ class TargetWriteTests(unittest.IsolatedAsyncioTestCase):
         manifest = json.loads(
             (ROOT / "custom_components" / "broilking" / "manifest.json").read_text()
         )
-        self.assertEqual(manifest["version"], "0.1.6")
+        self.assertEqual(manifest["version"], "0.1.7")
 
     def test_conversion_and_display_round_trip(self):
         stub_homeassistant()
@@ -338,8 +338,9 @@ class TargetWriteTests(unittest.IsolatedAsyncioTestCase):
             await client.async_get_temperatures()
 
     def test_device_error_is_home_assistant_error(self):
-        self.assertTrue(issubclass(self.api.BroilKingError, HomeAssistantError))
-        self.assertFalse(issubclass(self.api.BroilKingError, ServiceValidationError))
+        names = {cls.__name__ for cls in self.api.BroilKingError.__mro__}
+        self.assertIn("HomeAssistantError", names)
+        self.assertNotIn("ServiceValidationError", names)
 
     async def test_missing_send_generic_handler_is_one_call(self):
         """Mongoose OS reports an unregistered method as code 404.
@@ -361,8 +362,10 @@ class TargetWriteTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(self.api.BroilKingError) as ctx:
             await client.async_set_probe_target_f(1, 175)
         err = ctx.exception
-        self.assertIsInstance(err, HomeAssistantError)
-        self.assertNotIsInstance(err, ServiceValidationError)
+        names = {cls.__name__ for cls in type(err).__mro__}
+        self.assertIsInstance(err, self.api.BroilKingError)
+        self.assertIn("HomeAssistantError", names)
+        self.assertNotIn("ServiceValidationError", names)
         text = str(err)
         self.assertEqual(
             text,
