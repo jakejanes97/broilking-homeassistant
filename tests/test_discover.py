@@ -169,7 +169,10 @@ class DiscoverTests(unittest.IsolatedAsyncioTestCase):
         frame = client._session.sent[0]
         self.assertEqual(frame["method"], "RPC.List")
         self.assertNotIn("args", frame)
-        self.assertEqual(client._session.timeouts, [self.api.DISCOVER_TIMEOUT])
+        recorded = client._session.timeouts[0]
+        self.assertEqual(len(client._session.timeouts), 1)
+        self.assertEqual(recorded.ws_receive, self.api.DISCOVER_TIMEOUT)
+        self.assertEqual(recorded.ws_close, self.api.DISCOVER_TIMEOUT)
         blob = json.dumps(result)
         self.assertNotIn(SECRET, blob)
         self.assertNotIn(HOST, blob)
@@ -215,14 +218,20 @@ class DiscoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["methods"], [])
         self.assertEqual(result["described"], [])
         self.assertEqual(len(client._session.sent), 1)
-        self.assertEqual(client._session.timeouts, [self.api.DISCOVER_TIMEOUT])
+        recorded = client._session.timeouts[0]
+        self.assertEqual(len(client._session.timeouts), 1)
+        self.assertEqual(recorded.ws_receive, self.api.DISCOVER_TIMEOUT)
+        self.assertEqual(recorded.ws_close, self.api.DISCOVER_TIMEOUT)
 
     async def test_timeout_does_not_retry_or_leak_host(self):
         session = _TimeoutSession()
         client = self.api.BroilKingClient(HOST, session, SECRET)
         result = await client.async_discover_commands()
         self.assertFalse(result["ok"])
-        self.assertEqual(session.calls, [self.api.DISCOVER_TIMEOUT])
+        recorded = session.calls[0]
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(recorded.ws_receive, self.api.DISCOVER_TIMEOUT)
+        self.assertEqual(recorded.ws_close, self.api.DISCOVER_TIMEOUT)
         blob = json.dumps(result)
         self.assertNotIn(HOST, blob)
         self.assertNotIn(SECRET, blob)
@@ -232,7 +241,9 @@ class DiscoverTests(unittest.IsolatedAsyncioTestCase):
     async def test_temperature_read_timeout_stays_ten_seconds(self):
         client = self.client([rpc_ok({"grillTemp": 1})])
         await client.async_get_temperatures()
-        self.assertEqual(client._session.timeouts, [10])
+        recorded = client._session.timeouts[0]
+        self.assertEqual(recorded.ws_receive, 10)
+        self.assertEqual(recorded.ws_close, 10)
         self.assertEqual(client._session.sent[0]["method"], "GetAllValues")
 
 

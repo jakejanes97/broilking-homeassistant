@@ -177,29 +177,41 @@ class BroilKingClient:
         if args is not None:
             frame["args"] = args
         url = f"ws://{self._host}/rpc"
+        # aiohttp 3.14 applies a float only to websocket close, and
+        # ClientWSTimeout.ws_receive did not stop a peer that accepted the
+        # handshake and then stayed silent. wait_for is the bound that does.
+        ws_timeout = aiohttp.ClientWSTimeout(ws_close=timeout, ws_receive=timeout)
         try:
-            async with self._session.ws_connect(url, timeout=timeout) as ws:
+            async with self._session.ws_connect(url, timeout=ws_timeout) as ws:
                 await ws.send_str(json.dumps(frame))
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        resp = json.loads(msg.data)
-                        if resp.get("id") != rid:
-                            continue
-                        err = resp.get("error")
-                        self._last_code = err.get("code") if isinstance(err, dict) else None
-                        if err is None:
-                            return True, resp.get("result")
-                        raw = err.get("message", "")
-                        try:
-                            payload = json.loads(raw)
-                        except (ValueError, TypeError):
-                            payload = raw
-                        return err.get("code", -1) == 0, payload
-                    if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        break
-        except (aiohttp.ClientError, OSError, TimeoutError) as exc:
+
+                async def _read_reply():
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            resp = json.loads(msg.data)
+                            if resp.get("id") != rid:
+                                continue
+                            err = resp.get("error")
+                            self._last_code = err.get("code") if isinstance(err, dict) else None
+                            if err is None:
+                                return True, resp.get("result")
+                            raw = err.get("message", "")
+                            try:
+                                payload = json.loads(raw)
+                            except (ValueError, TypeError):
+                                payload = raw
+                            return err.get("code", -1) == 0, payload
+                        if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+                    raise BroilKingError(f"no reply to {method}")
+
+                return await asyncio.wait_for(_read_reply(), timeout)
+        except BroilKingError:
+            raise
+        except TimeoutError as exc:
+            raise BroilKingError(f"RPC {method} timed out") from exc
+        except (aiohttp.ClientError, OSError) as exc:
             raise BroilKingError(f"RPC {method} failed: {exc}") from exc
-        raise BroilKingError(f"no reply to {method}")
 
     # ---- reads ---------------------------------------------------------
     async def async_get_info(self) -> dict:

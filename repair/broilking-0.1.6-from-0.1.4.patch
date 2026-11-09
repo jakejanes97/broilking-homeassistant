@@ -1,0 +1,119 @@
+--- a/api.py
++++ b/api.py
+@@ -177,29 +177,41 @@
+         if args is not None:
+             frame["args"] = args
+         url = f"ws://{self._host}/rpc"
++        # aiohttp 3.14 applies a float only to websocket close, and
++        # ClientWSTimeout.ws_receive did not stop a peer that accepted the
++        # handshake and then stayed silent. wait_for is the bound that does.
++        ws_timeout = aiohttp.ClientWSTimeout(ws_close=timeout, ws_receive=timeout)
+         try:
+-            async with self._session.ws_connect(url, timeout=timeout) as ws:
++            async with self._session.ws_connect(url, timeout=ws_timeout) as ws:
+                 await ws.send_str(json.dumps(frame))
+-                async for msg in ws:
+-                    if msg.type == aiohttp.WSMsgType.TEXT:
+-                        resp = json.loads(msg.data)
+-                        if resp.get("id") != rid:
+-                            continue
+-                        err = resp.get("error")
+-                        self._last_code = err.get("code") if isinstance(err, dict) else None
+-                        if err is None:
+-                            return True, resp.get("result")
+-                        raw = err.get("message", "")
+-                        try:
+-                            payload = json.loads(raw)
+-                        except (ValueError, TypeError):
+-                            payload = raw
+-                        return err.get("code", -1) == 0, payload
+-                    if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+-                        break
+-        except (aiohttp.ClientError, OSError, TimeoutError) as exc:
++
++                async def _read_reply():
++                    async for msg in ws:
++                        if msg.type == aiohttp.WSMsgType.TEXT:
++                            resp = json.loads(msg.data)
++                            if resp.get("id") != rid:
++                                continue
++                            err = resp.get("error")
++                            self._last_code = err.get("code") if isinstance(err, dict) else None
++                            if err is None:
++                                return True, resp.get("result")
++                            raw = err.get("message", "")
++                            try:
++                                payload = json.loads(raw)
++                            except (ValueError, TypeError):
++                                payload = raw
++                            return err.get("code", -1) == 0, payload
++                        if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
++                            break
++                    raise BroilKingError(f"no reply to {method}")
++
++                return await asyncio.wait_for(_read_reply(), timeout)
++        except BroilKingError:
++            raise
++        except TimeoutError as exc:
++            raise BroilKingError(f"RPC {method} timed out") from exc
++        except (aiohttp.ClientError, OSError) as exc:
+             raise BroilKingError(f"RPC {method} failed: {exc}") from exc
+-        raise BroilKingError(f"no reply to {method}")
+ 
+     # ---- reads ---------------------------------------------------------
+     async def async_get_info(self) -> dict:
+--- a/__init__.py
++++ b/__init__.py
+@@ -1,7 +1,5 @@
+ """The Broil King Smoker integration."""
+ from __future__ import annotations
+-
+-import voluptuous as vol
+ 
+ from homeassistant.config_entries import ConfigEntry
+ from homeassistant.const import CONF_HOST, CONF_PASSWORD, Platform
+@@ -12,6 +10,7 @@
+ from .api import BroilKingClient
+ from .const import DOMAIN
+ from .coordinator import BroilKingCoordinator
++from .discover_schema import DISCOVER_SCHEMA
+ 
+ # On-demand RPC.List. The schema rejects every other field, including an RPC name.
+ SERVICE_DISCOVER = "discover_commands"
+@@ -68,10 +67,7 @@
+         DOMAIN,
+         SERVICE_DISCOVER,
+         _discover,
+-        schema=vol.Schema(
+-            {vol.Optional("entry_id"): str},
+-            extra=vol.PREVENT,
+-        ),
++        schema=DISCOVER_SCHEMA,
+         supports_response=SupportsResponse.OPTIONAL,
+     )
+ 
+--- a/manifest.json
++++ b/manifest.json
+@@ -7,5 +7,5 @@
+   "iot_class": "local_polling",
+   "issue_tracker": "https://github.com/bbirke/broilking-homeassistant/issues",
+   "requirements": [],
+-  "version": "0.1.4"
++  "version": "0.1.6"
+ }
+--- /dev/null
++++ b/discover_schema.py
+@@ -0,0 +1,13 @@
++"""Schema for broilking.discover_commands.
++
++Home Assistant 2026.11 aliases ``voluptuous`` to ``probatio._vol_shim``.
++That module has ``PREVENT_EXTRA`` and does not have ``PREVENT``.
++"""
++from __future__ import annotations
++
++import voluptuous as vol
++
++DISCOVER_SCHEMA = vol.Schema(
++    {vol.Optional("entry_id"): str},
++    extra=vol.PREVENT_EXTRA,
++)

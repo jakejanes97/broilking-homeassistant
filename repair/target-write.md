@@ -1,14 +1,43 @@
-# Setup fix 0.1.5 for Home Assistant 2026.11
+# 0.1.6 after an in-memory Home Assistant 2026.11 run
 
-Installed 0.1.4 fails while loading. `import voluptuous as vol` inside Home Assistant 2026.11 is `probatio._vol_shim` from probatio 0.13.0, and that module has no `PREVENT`. Setup raises `AttributeError` at the discover-service schema and the integration stays unloaded. No RPC call and no target write ran.
+The device is still on 0.1.4, which fails setup because `vol.PREVENT` does not exist. 0.1.6 is the tree that was loaded into Home Assistant 2026.11.0. It includes the `PREVENT_EXTRA` schema and a reply timeout that actually ends a silent websocket. The setpoint is still not fixed. `climate.py`, `number.py`, `coordinator.py`, and `services.yaml` are unchanged.
 
-0.1.5 builds that schema with `extra=vol.PREVENT_EXTRA`, which is the constant Home Assistant core uses for the same “reject unknown keys” rule. The action is otherwise the 0.1.4 diagnostic. `GetAllValues`, climate, number, coordinator, and `services.yaml` are unchanged.
+## What was installed for the check
 
-This environment did not boot Home Assistant 2026.11.0. That package requires Python >=3.14.2, and the tests ran on Python 3.12.3, so `import homeassistant` fails here. The regression did install probatio 0.13.0, the version pinned by Home Assistant 2026.11.0, called `install_as_voluptuous()` so `import voluptuous` is `probatio._vol_shim`, reproduced the missing `PREVENT` attribute, and called `schema(service_data)` the way `ServiceRegistry.async_call` does in core tag 2026.11.0. Unknown fields raise `probatio.Invalid`. The service was not registered on a running Home Assistant process, and the grill was not contacted.
+```text
+uv 0.13.7
+uv python install 3.14
+uv venv /tmp/ha202611 --python 3.14
+uv pip install --python /tmp/ha202611/bin/python 'homeassistant==2026.11.0'
+```
 
-## Check, then copy
+That environment resolved to Python 3.14.10, homeassistant 2026.11.0, probatio 0.13.0, and aiohttp 3.14.5. Importing `homeassistant` aliases `voluptuous` to `probatio._vol_shim`. That module has `PREVENT_EXTRA` and does not have `PREVENT`.
 
-Apply only `repair/broilking-0.1.5-from-0.1.4.patch` with `patch -p1` from the component directory that is currently 0.1.4. Do not go back through the 0.1.2 patch.
+## What the in-memory instance did
+
+`/tmp/ha202611/bin/python -m unittest tests.test_ha202611_runtime -v` loaded this component through Home Assistant's config-entry setup. Registries, the frame helper, and the network component were the real ones. The grill was a stand-in bound to `127.0.0.1` on a random port. Nothing connected to an external Home Assistant or to the grill.
+
+Result: 1 test, OK, about 10 seconds.
+
+- Config entry state was `loaded`.
+- `broilking.discover_commands` was registered with `supports_response` `optional`.
+- `{}` with `return_response=True` returned the discovery dict. `FS.Get` and `Config.Get` were omitted. The host and password were not in the response. The stand-in saw one `RPC.List` and no `SendGenericCommand`, `FS.Get`, or `Config.Get`.
+- `{"method": "FS.Get"}` raised `probatio.Invalid` inside `ServiceRegistry.async_call` before another list call.
+- The same action with `return_response=False` returned `None`.
+- When the stand-in then listed `SendGenericCommand`, the next call described only that name.
+- A stand-in that accepted `RPC.List` and then stayed silent made the action return `ok: false` with `RPC RPC.List timed out` in under 12 seconds, and that list was not retried.
+- Unloading the config entry removed the service.
+- Setup still reads with `GetAllValues`. The stand-in answered that read.
+
+aiohttp 3.14 does not treat a float `timeout` as a reply deadline, and `ClientWSTimeout.ws_receive` also did not stop the silent peer in a direct check. 0.1.6 therefore wraps the read in `asyncio.wait_for` for the same 8 second discovery limit and the existing 10 second read limit. A prompt reply is unchanged.
+
+Home Assistant logged that `BroilKingGrill` still uses `_attr_temperature_unit`, `current_temperature`, and `target_temperature`, which it says stop working in 2027.11. Those entities were still created. This build does not change them.
+
+`python3 -m unittest tests.test_ha202611_schema tests.test_target_write tests.test_discover` on Python 3.12.3 passed 32 tests. That interpreter cannot import homeassistant 2026.11.0. The runtime test above is the one that used the real service registry.
+
+## Install on the current 0.1.4 files
+
+Apply only `repair/broilking-0.1.6-from-0.1.4.patch` with `patch -p1` from the component directory. Do not apply the 0.1.5 patch first. `backup_pre_0.1.4` remains the 0.1.2 rollback.
 
 Hashes that must match before the patch:
 
@@ -19,27 +48,18 @@ aabc62de38f01c30887e1d520035b601b0a2562c2c114bbe1e7e873b3032f266  api.py
 4076550d4200e2377a25bc31e51032e8e855a66b1efa4ff36a10f795d1c3e6ca  services.yaml
 ```
 
-`api.py` and `services.yaml` stay on those hashes. After the patch:
+`services.yaml`, `climate.py`, `number.py`, and `coordinator.py` stay as they are. After the patch:
 
 ```
+77da1f2589b05ce0cdafe7ddb50880b71f28935af17b87b4f9d6e903fc2a812f  api.py
 b779f3516b4404fc5db33c5e2403d95ac52b1454e34240a0c0eb077ac49d3079  __init__.py
-423057142aaf8aaad5e824028a5ce35ef33c697a70e057ba5557828dfda452ae  manifest.json
+e739172ac2e9a062ce56b4737e5e37555d57fa06757471c83465168111fef288  manifest.json
 17d78bf847a47a0728746c4adfa11a2216ec89c11ad68a1d54e3f8120f8d3f98  discover_schema.py
 ```
 
-Manifest version is `0.1.5`. `discover_schema.py` is new. Leave every other file, including `translations/`, in place.
+Manifest version is `0.1.6`. The archive is `repair/broilking-target-repair.tar.gz`. From the extracted directory, `sha256sum -c repair/SHA256SUMS`.
 
-The archive `repair/broilking-target-repair.tar.gz` contains the full component, this note, the patch, checksums, and the tests. From the extracted directory, `sha256sum -c repair/SHA256SUMS`.
-
-## Restart once, then the same action
-
-Restart Home Assistant once. Do not call `number.set_value`, `climate.set_temperature`, `climate.set_hvac_mode`, or `climate.set_preset_mode`.
-
-In Developer Tools → Actions, run `broilking.discover_commands` with no data. If more than one Broil King config entry is loaded, pass that entry id and no other field. A field such as `method` or `command` is rejected by the schema.
-
-REST: `POST /api/services/broilking/discover_commands?return_response` with body `{}`.
-
-Success shape:
+Restart Home Assistant once. Then run `broilking.discover_commands` with no data. Do not call `number.set_value`, `climate.set_temperature`, `climate.set_hvac_mode`, or `climate.set_preset_mode`.
 
 ```json
 {
@@ -51,10 +71,4 @@ Success shape:
 }
 ```
 
-`described` stays empty unless the list actually contains `SendGenericCommand`. A missing `RPC.List` handler returns `ok: false` and `error: "No handler for RPC.List"` after that one call. The response does not include the grill address or password.
-
-`RPC.List` is one call, no arguments, 8 second timeout, no retry. `RPC.Describe` runs only for the documented name `SendGenericCommand` when that name is in the list. `FS.Get` and `Config.Get` are not called.
-
-## Tests
-
-`python3 -m unittest tests.test_ha202611_schema tests.test_target_write tests.test_discover` — 32 tests. `test_ha202611_schema` requires `probatio==0.13.0` and does not mock the schema engine. The other tests remain offline and do not open a socket.
+`described` stays empty unless the list contains `SendGenericCommand`. A missing `RPC.List` returns `ok: false` and `error: "No handler for RPC.List"` after one call.
